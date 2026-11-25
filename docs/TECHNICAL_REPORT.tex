@@ -1,0 +1,140 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[T1]{fontenc}
+\usepackage{url}
+
+\title{A Small Systolic Matrix Multiplication Accelerator}
+\author{\IEEEauthorblockN{Pihu Jaitly \and Ritik Raj}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report describes a parameterized, output-stationary systolic array for signed square-matrix multiplication in Verilog. The default $3\times3$ implementation contains nine processing elements (PEs), accepts one matrix element per load cycle, and produces a packed matrix result after seven compute cycles. Self-checking simulation covers $N=1$, 3, and 4. Yosys synthesis of the default configuration maps nine DSP48E1 blocks and 544 flip-flops to Xilinx 7-series primitives. The reported performance is a cycle-level projection; routed timing and physical-board operation have not been measured.
+\end{abstract}
+
+\begin{IEEEkeywords}
+systolic array, matrix multiplication, FPGA, Verilog, output-stationary architecture
+\end{IEEEkeywords}
+
+\section{Introduction}
+The accelerator computes $C=AB$ for two signed $N\times N$ matrices. The default design uses $N=3$ processing elements per row and column. Each PE holds one output accumulator, forwards an $A$ operand to the right, and forwards a $B$ operand downward. Operand registers, a load interface, and a cycle controller are implemented in the top-level \texttt{systolic\_array} module; each \texttt{pe} contains a \texttt{mac} module. This arrangement performs the $N^3$ useful multiply--accumulate (MAC) operations with $N^2$ physical MAC units.
+
+\section{Literature Review}
+Kung introduced systolic architectures as regular networks of simple processing elements that reuse data as it travels through the network, reducing the need for repeated memory access \cite{kung1982}. This principle suits matrix multiplication because each input element participates in several products. Jouppi \emph{et al.} described a much larger matrix multiplication unit in the first-generation Tensor Processing Unit, demonstrating the practical value of dense MAC arrays for machine-learning inference \cite{jouppi2017}. These works motivate local communication and operand reuse. The present project is a small FPGA-oriented teaching implementation with a single-element loader, so its measured resource counts and projected cycle gains should not be compared directly with the deployed ASIC results in \cite{jouppi2017}.
+
+\section{Proposed Solution}
+\subsection{Architecture and Data Movement}
+At compute step $t$, the left boundary of row $r$ receives $A_{r,t-r}$ when $0\leq t-r<N$; the top boundary of column $c$ receives $B_{t-c,c}$ when $0\leq t-c<N$. All other boundary values are zero. Each enabled PE performs
+\begin{equation}
+q_{r,c}\leftarrow q_{r,c}+a_{r,c}b_{r,c}
+\end{equation}
+and registers its incoming operands for its right and lower neighbors. The two operands for product $A_{r,k}B_{k,c}$ meet at PE $(r,c)$ at step $k+r+c$. Consequently, each local accumulator computes
+\begin{equation}
+C_{r,c}=\sum_{k=0}^{N-1} A_{r,k}B_{k,c}.
+\end{equation}
+Zero padding handles inactive steps without a per-PE valid signal. The accumulators clear on an accepted \texttt{start} and on synchronous reset.
+
+\begin{table}[t]
+\caption{Boundary schedule for the $3\times3$ array}
+\label{tab:schedule}
+\centering
+\footnotesize
+\begin{tabular}{@{}c p{0.37\columnwidth} p{0.37\columnwidth}@{}}
+\toprule
+Step & Left inputs, rows 0/1/2 & Top inputs, cols. 0/1/2 \\
+\midrule
+0 & $A_{00},0,0$ & $B_{00},0,0$ \\
+1 & $A_{01},A_{10},0$ & $B_{10},B_{01},0$ \\
+2 & $A_{02},A_{11},A_{20}$ & $B_{20},B_{11},B_{02}$ \\
+3 & $0,A_{12},A_{21}$ & $0,B_{21},B_{12}$ \\
+4 & $0,0,A_{22}$ & $0,0,B_{22}$ \\
+5--6 & $0,0,0$ & $0,0,0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:schedule} shows the input skew for $N=3$. Steps 5 and 6 drain products already traveling through the array. The packed output bus stores $C_{r,c}$ at bit slice \texttt{[(r*N+c)*ACC\_W +: ACC\_W]} in row-major order.
+
+\subsection{Control and Numeric Format}
+The controller has idle and run phases, indicated by \texttt{busy}. A one-cycle \texttt{start} pulse while idle clears the PEs and sets the step counter to zero. The run phase advances through step $3N-3$, then asserts \texttt{done} for one cycle. Reset is active high and synchronous. Loading and starting on the same idle edge is supported: the written operand is available before compute step zero. Writes and new starts during \texttt{busy} are ignored. Results stay stable after completion until the next start or reset; during a job they are partial sums.
+
+The load interface writes one signed \texttt{W}-bit element per edge. \texttt{load\_b} selects matrix $B$ rather than $A$, and \texttt{load\_row} and \texttt{load\_col} select the destination. Out-of-range indices are ignored. The operand buffers persist between jobs and clear on reset. A held-high \texttt{start} may launch another job after the controller becomes idle, so a pulse is the usual handshake.
+
+Default operands are signed 8-bit two's-complement integers. The default accumulator width is
+\begin{equation}
+\mathrm{ACC\_W}=2W+\lceil\log_2 N\rceil,
+\end{equation}
+which is 18 bits for $N=3$ or 4. This accommodates the worst-case $N$-term signed dot product. An explicitly smaller width permits wraparound overflow. Fixed-point use requires no hardware change: with four fractional input bits, an input represents its raw value divided by 16 and the output represents its raw value divided by 256. For example, raw values 24 and $-8$ represent 1.5 and $-0.5$; their raw product $-192$ represents $-0.75$. There is no internal rounding or rescaling.
+
+\section{Results and Discussion}
+\subsection{Latency and Analytical Comparison}
+The last useful product reaches the bottom-right PE at step $3N-3$. Counting steps from zero, the compute phase therefore lasts
+\begin{equation}
+L=3N-2\quad\text{cycles}.
+\end{equation}
+The accepted start edge is a separate preparation edge. For comparison, an analytical single-MAC engine that receives operands without stalls needs $N^3$ compute cycles. Table~\ref{tab:perf} separates this equal-clock compute comparison from loading and preparation. No sequential baseline RTL or measured baseline frequency is claimed.
+
+\begin{table}[t]
+\caption{Cycle-level performance comparison}
+\label{tab:perf}
+\centering
+\footnotesize
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Metric & $N=3$ & $N=4$ \\
+\midrule
+Physical MAC units & 9 & 16 \\
+Useful MACs per job & 27 & 64 \\
+Array compute cycles $L$ & 7 & 10 \\
+Single-MAC compute cycles & 27 & 64 \\
+Compute-cycle speedup $N^3/L$ & $3.86\times$ & $6.40\times$ \\
+PE utilization $N/(3N-2)$ & 42.86\% & 40.00\% \\
+Retained-input start interval & 8 & 11 \\
+Fresh-input start interval & 26 & 43 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The one-element-per-cycle loader needs $2N^2$ writes for fresh matrices. With no extra idle edges, a fresh-input transaction requires $2N^2+1+L$ cycles, or 26 cycles at $N=3$; retained inputs require $1+L$ cycles. At a hypothetical 100\,MHz clock, seven compute cycles would take 70\,ns and the fresh-input rate would be $100\times10^6/26\approx3.85$ million matrix products per second. These are arithmetic projections, not achieved timing. Under the same 18-write and one-preparation-edge assumptions, the $N=3$ end-to-end cycle ratio against the analytical single-MAC baseline is $(18+1+27)/26\approx1.77$. The supplied testbench includes extra idle edges for readability.
+
+\subsection{Verification and Synthesis Results}
+The supplied Icarus Verilog testbench passed a dedicated PE test and 27 array jobs each at $N=1$, 3, and 4. It checks reference matrix values, latency, handshake behavior, interference while busy, \texttt{done} pulse width, accumulator reuse, and reset abort and recovery. The $N=3$ demonstration produced rows $(30,24,18)$, $(84,69,54)$, and $(138,114,90)$. VCD waveforms expose operand movement and partial sums.
+
+Yosys 0.70+post was used for both synthesis flows with default $N=3$, $W=8$, and $\mathrm{ACC\_W}=18$. The generic mapped design contains 6795 cells including submodules. The separate Xilinx 7-series mapping gives the resources in Table~\ref{tab:resources}; the generic and device-specific counts are not interchangeable.
+
+\begin{table}[t]
+\caption{Xilinx 7-series synthesis mapping, default design}
+\label{tab:resources}
+\centering
+\footnotesize
+\begin{tabular}{@{}lr@{}}
+\toprule
+Primitive & Count \\
+\midrule
+DSP48E1 & 9 \\
+FDRE flip-flops & 544 \\
+LUT2 / LUT3 / LUT4 / LUT5 / LUT6 & 26 / 102 / 36 / 32 / 102 \\
+Total LUT primitives & 298 \\
+CARRY4 & 28 \\
+BUFG & 1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The small operand buffers map to registers; no block RAM is inferred. LUT primitives are a synthesis mapping count, not final occupied slices. Resource counts may change with tool version or optimization settings. Maximum operating frequency has not been measured. The optional \texttt{scripts/vivado.tcl} flow targets routed core timing on an Artix-7 device, but was not part of the completed validation; its excluded external paths would not validate the external matrix interface.
+
+\section{Individual Contributions}
+The following is a proposed division of project responsibilities; it does not claim a verified history of who authored the existing files. \textbf{Pihu Jaitly:} architecture and dataflow explanation, RTL review of the PE and controller, and literature review and report editing. \textbf{Ritik Raj:} testbench execution and waveform review, synthesis and resource analysis, and results and discussion. Both contributors should review the final RTL, reproduced results, and report before submission.
+
+\section{Conclusion}
+This is a simulation-verified accelerator core with reproducible synthesis scripts, not a deployed FPGA system. It does not include a CPU bus, DMA, UART, board pin mapping, overlapping jobs, or double buffering. Dynamic buffer addressing and 32-bit controller indices favor simple use over minimum area. A board implementation would need a communication wrapper and board-specific constraints. Further work includes a sequential RTL baseline, routed timing measurements, narrower indexing, and double-buffered input streaming.
+
+\begin{thebibliography}{2}
+\bibitem{kung1982} H. T. Kung, ``Why systolic architectures?,'' \emph{Computer}, vol. 15, no. 1, pp. 37--46, Jan. 1982. [Online]. Available: \url{https://www.eecs.harvard.edu/~htk/publication/1982-kung-why-systolic-architecture.pdf}
+\bibitem{jouppi2017} N. P. Jouppi \emph{et al.}, ``In-datacenter performance analysis of a Tensor Processing Unit,'' in \emph{Proc. 44th Annu. Int. Symp. Computer Architecture (ISCA)}, 2017, pp. 1--12, doi: 10.1145/3079856.3080246.
+\end{thebibliography}
+
+\end{document}
